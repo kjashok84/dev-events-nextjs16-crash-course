@@ -1,11 +1,17 @@
 import ExploreBtn from "./components/ExploreBtn"
 import EventCard from "./components/EventCard"
-import type { Event } from "@prisma/client"
+import prisma from "@/lib/prisma"
+import { cacheLife } from "next/cache"
 
-const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL
 const Page = async () => {
-  const response = await fetch(`${BASE_URL}/api/events`);
-  const events: Event[] = await response.json();
+  'use cache';
+  cacheLife('hours');
+  // Query the database directly instead of fetching our own API route.
+  // Fetching `${BASE_URL}/api/events` (localhost) fails during `next build`
+  // prerendering/export, since no server is listening on that port yet.
+  const events = await prisma.event.findMany({
+    orderBy: { createdAt: "desc" },
+  });
   console.log("Fetched events:", events);
 
   return (
