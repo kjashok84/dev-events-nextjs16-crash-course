@@ -1,5 +1,6 @@
 import { notFound } from "next/navigation";
 import Image from "next/image";
+import { Suspense } from "react";
 import BookEvent from "@/app/components/BookEvent";
 import { getSimilarEventsBySlug } from "@/lib/actions/event.action";
 import EventCard from "@/app/components/EventCard";
@@ -41,12 +42,17 @@ const EventTags = ({ tags }: { tags: string[] }) => {
   );
 };
 
-const EventDetailPage = async ({ params }: { params: Promise<{ slug: string }> }) => {
+// Fetches event details + similar events per-request. Wrapped in <Suspense>
+// by the parent page so it doesn't block prerendering (required when
+// nextConfig.cacheComponents is enabled). Also resolves the `params` promise
+// here, since accessing dynamic params outside <Suspense> also blocks
+// prerendering.
+const EventDetailContent = async ({ params }: { params: Promise<{ slug: string }> }) => {
   const { slug } = await params;
   console.log("Fetching event details for slug:", slug);
   const BASE_URL = process.env.NEXT_PUBLIC_BASE_URL;
   const response = await fetch(`${BASE_URL}/api/events/${slug}`);
-  const { title, description, image, overview, venue, location, date, time, mode, audience, agenda, organizer, tags } = await response.json();
+  const { id, title, description, image, overview, location, date, time, mode, audience, agenda, organizer, tags } = await response.json();
   console.log("Fetched event:", { title, description, image });
   if (!title) return notFound();
 
@@ -55,7 +61,7 @@ const EventDetailPage = async ({ params }: { params: Promise<{ slug: string }> }
   const similarEvents = await getSimilarEventsBySlug(slug)
 
   return (
-    <section id="event">
+    <>
       <div className="header">
         <h1>Event Description</h1>
         <p>{description}</p>
@@ -96,7 +102,7 @@ const EventDetailPage = async ({ params }: { params: Promise<{ slug: string }> }
               </p>
             )}
           </div>
-          <BookEvent />
+          <BookEvent eventId={id} slug={slug} />
         </aside>
       </div>
 
@@ -110,9 +116,17 @@ const EventDetailPage = async ({ params }: { params: Promise<{ slug: string }> }
           ))}
         </div>
       </div>
+    </>
+  );
+};
+
+const EventDetailPage = ({ params }: { params: Promise<{ slug: string }> }) => {
+  return (
+    <section id="event">
+      <Suspense fallback={<p className="text-center mt-10">Loading event...</p>}>
+        <EventDetailContent params={params} />
+      </Suspense>
     </section>
-
-
   );
 };
 
