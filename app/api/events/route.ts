@@ -2,6 +2,8 @@ import prisma from "@/lib/prisma";
 import { NextRequest, NextResponse } from "next/server";
 import { v2 as cloudinary } from "cloudinary"
 import { Prisma } from "@prisma/client"
+import { promises as fs } from "fs";
+import path from "path";
 
 // Note: the NODE_TLS_REJECT_UNAUTHORIZED dev-only workaround (for corporate
 // VPNs/proxies performing TLS inspection) is set in instrumentation.ts,
@@ -33,6 +35,21 @@ function splitList(value: FormDataEntryValue | undefined): string[] {
         .split(",")
         .map((item) => item.trim())
         .filter(Boolean)
+}
+
+// Map common image mime types to file extensions for local fallback
+function mimeToExt(mime?: string): string {
+    if (!mime) return ".jpg";
+    const map: Record<string, string> = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/svg+xml": ".svg",
+        "image/avif": ".avif",
+    };
+    return map[mime] || ".jpg";
 }
 
 export async function POST(req: NextRequest) {
@@ -73,16 +90,51 @@ export async function POST(req: NextRequest) {
 
         const arrayBuffer = await file.arrayBuffer();
         const buffer = Buffer.from(arrayBuffer);
-        const uploadResult = await new Promise((resolve, reject) => {
-            cloudinary.uploader.upload_stream({ resource_type: "image", folder: 'DevEvent', timeout: 15000 }, (error, result) => {
-                if (error) {
-                    reject(new Error(error.message || "Cloudinary upload failed"));
-                } else {
-                    resolve(result);
+
+        // Attempt Cloudinary upload first; on failure, fall back to writing
+        // the file to disk in development so uploads still work behind
+        // corporate proxies / TLS interception during dev.
+        let imageUrl = "";
+        try {
+            const uploadResult = await new Promise((resolve, reject) => {
+                cloudinary.uploader.upload_stream({ resource_type: "image", folder: 'DevEvent', timeout: 15000 }, (error, result) => {
+                    if (error) {
+                        reject(new Error(error.message || "Cloudinary upload failed"));
+                    } else {
+                        resolve(result);
+                    }
+                }).end(buffer);
+            });
+            imageUrl = (uploadResult as { secure_url: string }).secure_url;
+        } catch (uploadErr) {
+            console.error("Cloudinary upload failed:", uploadErr);
+            // Dev-only local fallback: write file to public/uploads/events and
+            // use a local URL. Production should bubble the error instead.
+            if (process.env.NODE_ENV !== "production") {
+                try {
+                    const uploadsDir = path.join(process.cwd(), "public", "uploads", "events");
+                    await fs.mkdir(uploadsDir, { recursive: true });
+
+                    const originalName = (file as any).name || `${slug}-${Date.now()}`;
+                    const ext = path.extname(originalName) || mimeToExt((file as any).type);
+                    const filename = `${slug}-${Date.now()}${ext}`;
+                    const filePath = path.join(uploadsDir, filename);
+
+                    await fs.writeFile(filePath, buffer);
+                    imageUrl = `/uploads/events/${filename}`;
+                    console.warn(`Saved uploaded image to local fallback: ${filePath}`);
+                } catch (fsErr) {
+                    console.error("Failed to save local fallback image:", fsErr);
+                    // Re-throw original upload error to be handled below
+                    throw uploadErr;
                 }
-            }).end(buffer);
-        });
-        eventData.image = (uploadResult as { secure_url: string }).secure_url;
+            } else {
+                // In production, reject and let outer catch handle the error
+                throw uploadErr;
+            }
+        }
+
+        eventData.image = imageUrl;
 
         const createEvent = await prisma.event.create({
             data: {
