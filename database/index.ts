@@ -1,5 +1,4 @@
-export { Event } from "./event.model"
-export type { IEvent } from "./event.model"
+// Re-export Prisma-generated types for convenient single-point imports.
+export type { Event, Booking, Mode } from "@prisma/client"
 
-export { Booking } from "./booking.model"
-export type { IBooking } from "./booking.model"
+export { default as prisma } from "../lib/prisma"
