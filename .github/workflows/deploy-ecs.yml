@@ -1,0 +1,153 @@
+name: Deploy to Amazon ECS
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ecs-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate deployment configuration
+        env:
+          AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          ECS_TASK_EXECUTION_ROLE_ARN: ${{ vars.ECS_TASK_EXECUTION_ROLE_ARN }}
+          DATABASE_URL_SECRET_ARN: ${{ vars.DATABASE_URL_SECRET_ARN }}
+          CLOUDINARY_URL_SECRET_ARN: ${{ vars.CLOUDINARY_URL_SECRET_ARN }}
+          NEXT_PUBLIC_BASE_URL: ${{ vars.NEXT_PUBLIC_BASE_URL }}
+          NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN: ${{ vars.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN }}
+          NEXT_PUBLIC_POSTHOG_HOST: ${{ vars.NEXT_PUBLIC_POSTHOG_HOST }}
+        run: |
+          required=(
+            AWS_ROLE_TO_ASSUME
+            AWS_REGION
+            ECR_REPOSITORY
+            ECS_CLUSTER
+            ECS_SERVICE
+            ECS_TASK_EXECUTION_ROLE_ARN
+            DATABASE_URL_SECRET_ARN
+            CLOUDINARY_URL_SECRET_ARN
+            NEXT_PUBLIC_BASE_URL
+            NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN
+            NEXT_PUBLIC_POSTHOG_HOST
+          )
+          for name in "${required[@]}"; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Repository variable $name is required."
+              exit 1
+            fi
+          done
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        id: build-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN=${{ vars.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN }}
+            NEXT_PUBLIC_POSTHOG_HOST=${{ vars.NEXT_PUBLIC_POSTHOG_HOST }}
+
+      - name: Create ECS task definition
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECS_TASK_EXECUTION_ROLE_ARN: ${{ vars.ECS_TASK_EXECUTION_ROLE_ARN }}
+          IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          NEXT_PUBLIC_BASE_URL: ${{ vars.NEXT_PUBLIC_BASE_URL }}
+          DATABASE_URL_SECRET_ARN: ${{ vars.DATABASE_URL_SECRET_ARN }}
+          CLOUDINARY_URL_SECRET_ARN: ${{ vars.CLOUDINARY_URL_SECRET_ARN }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const taskDefinition = {
+            family: "dev-events-nextjs16",
+            executionRoleArn: process.env.ECS_TASK_EXECUTION_ROLE_ARN,
+            networkMode: "awsvpc",
+            requiresCompatibilities: ["FARGATE"],
+            cpu: "512",
+            memory: "1024",
+            containerDefinitions: [
+              {
+                name: "dev-events",
+                image: process.env.IMAGE_URI,
+                essential: true,
+                portMappings: [
+                  { containerPort: 3000, hostPort: 3000, protocol: "tcp" }
+                ],
+                environment: [
+                  { name: "NODE_ENV", value: "production" },
+                  { name: "HOSTNAME", value: "0.0.0.0" },
+                  { name: "PORT", value: "3000" },
+                  {
+                    name: "NEXT_PUBLIC_BASE_URL",
+                    value: process.env.NEXT_PUBLIC_BASE_URL
+                  }
+                ],
+                secrets: [
+                  {
+                    name: "DATABASE_URL",
+                    valueFrom: process.env.DATABASE_URL_SECRET_ARN
+                  },
+                  {
+                    name: "CLOUDINARY_URL",
+                    valueFrom: process.env.CLOUDINARY_URL_SECRET_ARN
+                  }
+                ],
+                logConfiguration: {
+                  logDriver: "awslogs",
+                  options: {
+                    "awslogs-group": "/ecs/dev-events",
+                    "awslogs-region": process.env.AWS_REGION,
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                }
+              }
+            ]
+          };
+
+          fs.writeFileSync(
+            "task-definition.json",
+            JSON.stringify(taskDefinition, null, 2)
+          );
+          NODE
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: task-definition.json
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
